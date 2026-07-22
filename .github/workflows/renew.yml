@@ -2,8 +2,8 @@ name: XServer-Vmail-VPS
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '46 0 * * *'  # UTC 00:46 = 北京时间 08:46
+  #schedule:
+  #  - cron: '46 0 * * *'  # UTC 00:46 = 北京时间 08:46
 
 jobs:
   run_xserver_renew:
