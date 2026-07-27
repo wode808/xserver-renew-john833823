@@ -24,10 +24,13 @@ jobs:
       - name: 🛡️ 启动 GOST 代理转发
         id: gost
         continue-on-error: true
-        if: ${{ secrets.GOST_PROXY != '' }}
         env:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
         run: |
+          if [ -z "$GOST_PROXY" ]; then
+            echo "⚠️ GOST_PROXY 未配置"
+            exit 1
+          fi
           set -e
           VERSION=$(curl -fsSL https://api.github.com/repos/ginuerzh/gost/releases/latest \
             | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
