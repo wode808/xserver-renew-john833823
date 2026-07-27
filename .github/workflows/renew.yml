@@ -45,58 +45,199 @@ jobs:
           | sed -E 's/([0-9]+\.[0-9]+\.)[0-9]+\.[0-9]+/\1**.**/g'
           echo
 
+      - name: 🔄 GOST 成功后重置重试次数
+        if: ${{ steps.gost.conclusion == 'success' }}
+        env:
+          CRON_JOB: ${{ secrets.CRON_JOB }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import json
+          import urllib.request
+
+          cron = os.environ.get("CRON_JOB", "")
+          if not cron or "," not in cron:
+              exit(0)
+
+          api_key, job_id = [x.strip() for x in cron.split(",",1)]
+
+          req = urllib.request.Request(
+              f"https://api.cron-job.org/jobs/{job_id}",
+              headers={"Authorization":f"Bearer {api_key}"}
+          )
+
+          job = json.load(
+              urllib.request.urlopen(req, timeout=15)
+          )["job"]
+
+          if job.get("comment") != "retry=0":
+              job["comment"] = "retry=0"
+
+              req = urllib.request.Request(
+                  f"https://api.cron-job.org/jobs/{job_id}",
+                  data=json.dumps({"job":job}).encode(),
+                  headers={
+                      "Authorization":f"Bearer {api_key}",
+                      "Content-Type":"application/json"
+                  },
+                  method="PATCH"
+              )
+
+              try:
+                  urllib.request.urlopen(req, timeout=15)
+                  print("retry 已清零")
+              except Exception as e:
+                  print(f"重置 retry 失败：{e}")
+                  raise
+          EOF    
+
       - name: ⚠️ GOST 失败写回 Cron 5分钟后重试
-        if: ${{ steps.gost.outcome == 'failure' }}
+        if: ${{ steps.gost.conclusion == 'failure' }}
         env:
           CRON_JOB: ${{ secrets.CRON_JOB }}
           TG_BOT: ${{ secrets.TG_BOT }}
         run: |
           python3 - <<'EOF'
-          import os, json, urllib.request, urllib.parse, datetime
+          import os
+          import re
+          import json
+          import urllib.request
+          import urllib.parse
+          import datetime
           from datetime import timedelta
-
+          
           cron_job = os.environ.get("CRON_JOB", "")
           if not cron_job or "," not in cron_job:
-              print("⚠️ 未配置 CRON_JOB，跳过")
-              exit(0)
-
+              print("⚠️ 未配置 CRON_JOB")
+              raise SystemExit(0)
+          
           api_key, job_id = [x.strip() for x in cron_job.split(",", 1)]
-          next_run = datetime.datetime.utcnow() + timedelta(hours=8, minutes=5)
+          
+          # 读取当前 Job
+          req = urllib.request.Request(
+              f"https://api.cron-job.org/jobs/{job_id}",
+              headers={"Authorization": f"Bearer {api_key}"}
+          )
+          
+          job = json.load(
+              urllib.request.urlopen(req, timeout=15)
+          )["job"]
 
-          data = {"job": {"schedule": {
-              "timezone": "Asia/Shanghai", "expiresAt": 0,
-              "hours": [next_run.hour], "minutes": [next_run.minute],
-              "mdays": [next_run.day], "months": [next_run.month], "wdays": [-1],
-          }}}
-          payload = json.dumps(data).encode()
+          # 当前 retry
+          comment = job.get("comment", "")
+          
+          m = re.search(r"retry=(\d+)", comment)
+          
+          retry = int(m.group(1)) if m else 0
+          
+          print(f"当前 retry={retry}")
+          
+          # 已连续失败5次
+          if retry >= 5:
+
+              # 重置 retry
+              job["comment"] = "retry=0"
+          
+              payload = json.dumps({"job": job}).encode()
+          
+              req = urllib.request.Request(
+                  f"https://api.cron-job.org/jobs/{job_id}",
+                  data=payload,
+                  headers={
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json"
+                  },
+                  method="PATCH"
+              )
+          
+              try:
+                  urllib.request.urlopen(req, timeout=15)
+                  print("retry 已清零")
+              except Exception:
+                  pass
+          
+              tg = os.environ.get("TG_BOT", "")
+          
+              if tg and "," in tg:
+                  chat_id, token = [x.strip() for x in tg.split(",", 1)]
+          
+                  msg = "⚠️ GOST 连续失败5次，已停止自动重试"
+          
+                  try:
+                      urllib.request.urlopen(
+                          f"https://api.telegram.org/bot{token}/sendMessage",
+                          data=urllib.parse.urlencode({
+                              "chat_id": chat_id,
+                              "text": msg
+                          }).encode(),
+                          timeout=10
+                      )
+                  except Exception:
+                      pass
+          
+              print("停止自动重试")
+              raise SystemExit(0)
+          
+          # retry+1
+          retry += 1
+          
+          job["comment"] = f"retry={retry}"
+          
+          next_run = datetime.datetime.utcnow() + timedelta(hours=8, minutes=5)
+          
+          job["schedule"] = {
+              "timezone": "Asia/Shanghai",
+              "expiresAt": 0,
+              "hours": [next_run.hour],
+              "minutes": [next_run.minute],
+              "mdays": [next_run.day],
+              "months": [next_run.month],
+              "wdays": [-1],
+          }
+          
+          payload = json.dumps({
+              "job": job
+          }).encode()
+          
           req = urllib.request.Request(
               f"https://api.cron-job.org/jobs/{job_id}",
               data=payload,
-              headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json"
+              },
               method="PATCH"
           )
+          
           try:
-            urllib.request.urlopen(req, timeout=15)
-            print(f"🔁 GOST 失败，已写回 Cron：{next_run.month:02d}月{next_run.day:02d}日 {next_run.hour:02d}:{next_run.minute:02d} 重试")
+              urllib.request.urlopen(req, timeout=15)
+              print(f"已写回 Cron，retry={retry}")
           except Exception as e:
-            print(f"❌ Cron 写回失败：{e}")
-          tg_bot = os.environ.get("TG_BOT", "")
-          if tg_bot and "," in tg_bot:
-              chat_id, token = [x.strip() for x in tg_bot.split(",", 1)]
-              msg = "⚠️ GOST 代理启动失败，已安排5分钟后重试"
+              print(f"❌ 写回 Cron 失败：{e}")
+              raise
+          
+          tg = os.environ.get("TG_BOT", "")
+          
+          if tg and "," in tg:
+              chat_id, token = [x.strip() for x in tg.split(",", 1)]
+          
+              msg = f"⚠️ GOST 启动失败，第 {retry}/5 次，5 分钟后重试"
+          
               try:
                   urllib.request.urlopen(
                       f"https://api.telegram.org/bot{token}/sendMessage",
-                      data=urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode(),
+                      data=urllib.parse.urlencode({
+                          "chat_id": chat_id,
+                          "text": msg
+                      }).encode(),
                       timeout=10
                   )
-                  print("📨 TG 推送成功")
-              except Exception as e:
-                  print(f"❌ TG 推送失败：{e}")
+              except Exception:
+                  pass
           EOF
 
       - name: 🛠️ 安装系统依赖
-        if: ${{ steps.gost.outcome != 'failure' }}
+        if: ${{ steps.gost.conclusion != 'failure' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -107,13 +248,13 @@ jobs:
             scrot
 
       - name: 🐍 安装 Python 依赖
-        if: ${{ steps.gost.outcome != 'failure' }}
+        if: ${{ steps.gost.conclusion != 'failure' }}
         run: |
           pip install seleniumbase
           seleniumbase install chromedriver
 
       - name: 🚀 运行脚本
-        if: ${{ steps.gost.outcome != 'failure' }}
+        if: ${{ steps.gost.conclusion != 'failure' }}
         env:
           PYTHONIOENCODING: utf-8
           XSERVER_ACCOUNT: ${{ secrets.XSERVER_ACCOUNT }}
