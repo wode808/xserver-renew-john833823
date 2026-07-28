@@ -23,34 +23,91 @@ jobs:
 
       - name: 🛡️ 启动 GOST 代理转发
         id: gost
-        continue-on-error: true
         env:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
+          TG_BOT: ${{ secrets.TG_BOT }}
+          XSERVER_ACCOUNT: ${{ secrets.XSERVER_ACCOUNT }}
         run: |
           if [ -z "$GOST_PROXY" ]; then
             echo "⚠️ GOST_PROXY 未配置"
             exit 1
           fi
+      
           set -e
+      
           VERSION=$(curl -fsSL https://api.github.com/repos/ginuerzh/gost/releases/latest \
             | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+      
           echo "📦 GOST 版本: $VERSION"
+      
           wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
           tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
           chmod +x gost
+      
           nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
           sleep 3
+      
           echo "✅ GOST 已启动，测试连通性..."
-          curl -fsS -x http://127.0.0.1:8080 https://api.ipify.org \
-          | sed -E 's/([0-9]+\.[0-9]+\.)[0-9]+\.[0-9]+/\1**.**/g'
-          echo
 
+          if IP=$(curl -fsS \
+              --max-time 15 \
+              -x http://127.0.0.1:8080 \
+              https://api.ipify.org)
+          then
+              echo "$IP" | sed -E 's/([0-9]+\.[0-9]+\.)[0-9]+\.[0-9]+/\1**.**/g'
+              echo
+              echo "✅ GOST 连通性测试成功"
+          else
+              echo
+              echo "❌ GOST 连通性测试失败"
+          
+              pkill -f "gost -L" || true
+          
+              if [ -n "$TG_BOT" ] && [[ "$TG_BOT" == *,* ]]; then
+                  CHAT_ID="${TG_BOT%%,*}"
+                  BOT_TOKEN="${TG_BOT#*,}"
+          
+                  RUN_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+
+                  MASKED_EMAIL="未知"
+                  
+                  if [ -n "$XSERVER_ACCOUNT" ]; then
+                      ACCOUNT="${XSERVER_ACCOUNT%%,*}"
+                  
+                      if [[ "$ACCOUNT" == *"@"* ]]; then
+                          NAME="${ACCOUNT%@*}"
+                          DOMAIN="${ACCOUNT#*@}"
+                  
+                          if [ ${#NAME} -le 3 ]; then
+                              MASKED_EMAIL="${NAME}********@${DOMAIN}"
+                          else
+                              MASKED_EMAIL="${NAME:0:3}********@${DOMAIN}"
+                          fi
+                      fi
+                  fi
+                  
+                  
+                  MSG="🔴 XServer VPS 续期通知
+                  🕐 运行时间: ${RUN_TIME}
+                  🖥 服务器: 🇯🇵 Xserver VPS
+                  🧑🏻‍🏫 用户名: ${MASKED_EMAIL}
+                  📊 续期结果: ⚠️ GOST 启动失败"
+                  
+                  curl -s \
+                    -X POST \
+                    "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${CHAT_ID}" \
+                    --data-urlencode "text=${MSG}"
+              fi
+          
+              exit 1
+          fi
+        
       - name: 🔄 GOST 成功后重置重试次数
-        if: ${{ steps.gost.conclusion == 'success' }}
         env:
           CRON_JOB: ${{ secrets.CRON_JOB }}
         run: |
-          python3 - <<'EOF'
+          python3 - <<'PYTHON'
           import os
           import json
           import urllib.request
@@ -66,9 +123,19 @@ jobs:
               headers={"Authorization":f"Bearer {api_key}"}
           )
 
-          job = json.load(
+          resp = json.load(
               urllib.request.urlopen(req, timeout=15)
-          )["job"]
+          )
+          
+          print("Cron API 返回：")
+          print(json.dumps(resp, ensure_ascii=False, indent=2))
+          
+          job = resp.get("job") or resp.get("jobDetails")
+          
+          if job is None:
+              raise RuntimeError(
+                  f"Cron API 返回异常：{json.dumps(resp, ensure_ascii=False)}"
+              )
 
           if job.get("comment") != "retry=0":
               job["comment"] = "retry=0"
@@ -89,155 +156,9 @@ jobs:
               except Exception as e:
                   print(f"重置 retry 失败：{e}")
                   raise
-          EOF    
-
-      - name: ⚠️ GOST 失败写回 Cron 5分钟后重试
-        if: ${{ steps.gost.conclusion == 'failure' }}
-        env:
-          CRON_JOB: ${{ secrets.CRON_JOB }}
-          TG_BOT: ${{ secrets.TG_BOT }}
-        run: |
-          python3 - <<'EOF'
-          import os
-          import re
-          import json
-          import urllib.request
-          import urllib.parse
-          import datetime
-          from datetime import timedelta
-          
-          cron_job = os.environ.get("CRON_JOB", "")
-          if not cron_job or "," not in cron_job:
-              print("⚠️ 未配置 CRON_JOB")
-              raise SystemExit(0)
-          
-          api_key, job_id = [x.strip() for x in cron_job.split(",", 1)]
-          
-          # 读取当前 Job
-          req = urllib.request.Request(
-              f"https://api.cron-job.org/jobs/{job_id}",
-              headers={"Authorization": f"Bearer {api_key}"}
-          )
-          
-          job = json.load(
-              urllib.request.urlopen(req, timeout=15)
-          )["job"]
-
-          # 当前 retry
-          comment = job.get("comment", "")
-          
-          m = re.search(r"retry=(\d+)", comment)
-          
-          retry = int(m.group(1)) if m else 0
-          
-          print(f"当前 retry={retry}")
-          
-          # 已连续失败5次
-          if retry >= 5:
-
-              # 重置 retry
-              job["comment"] = "retry=0"
-          
-              payload = json.dumps({"job": job}).encode()
-          
-              req = urllib.request.Request(
-                  f"https://api.cron-job.org/jobs/{job_id}",
-                  data=payload,
-                  headers={
-                      "Authorization": f"Bearer {api_key}",
-                      "Content-Type": "application/json"
-                  },
-                  method="PATCH"
-              )
-          
-              try:
-                  urllib.request.urlopen(req, timeout=15)
-                  print("retry 已清零")
-              except Exception:
-                  pass
-          
-              tg = os.environ.get("TG_BOT", "")
-          
-              if tg and "," in tg:
-                  chat_id, token = [x.strip() for x in tg.split(",", 1)]
-          
-                  msg = "⚠️ GOST 连续失败5次，已停止自动重试"
-          
-                  try:
-                      urllib.request.urlopen(
-                          f"https://api.telegram.org/bot{token}/sendMessage",
-                          data=urllib.parse.urlencode({
-                              "chat_id": chat_id,
-                              "text": msg
-                          }).encode(),
-                          timeout=10
-                      )
-                  except Exception:
-                      pass
-          
-              print("停止自动重试")
-              raise SystemExit(0)
-          
-          # retry+1
-          retry += 1
-          
-          job["comment"] = f"retry={retry}"
-          
-          next_run = datetime.datetime.utcnow() + timedelta(hours=8, minutes=5)
-          
-          job["schedule"] = {
-              "timezone": "Asia/Shanghai",
-              "expiresAt": 0,
-              "hours": [next_run.hour],
-              "minutes": [next_run.minute],
-              "mdays": [next_run.day],
-              "months": [next_run.month],
-              "wdays": [-1],
-          }
-          
-          payload = json.dumps({
-              "job": job
-          }).encode()
-          
-          req = urllib.request.Request(
-              f"https://api.cron-job.org/jobs/{job_id}",
-              data=payload,
-              headers={
-                  "Authorization": f"Bearer {api_key}",
-                  "Content-Type": "application/json"
-              },
-              method="PATCH"
-          )
-          
-          try:
-              urllib.request.urlopen(req, timeout=15)
-              print(f"已写回 Cron，retry={retry}")
-          except Exception as e:
-              print(f"❌ 写回 Cron 失败：{e}")
-              raise
-          
-          tg = os.environ.get("TG_BOT", "")
-          
-          if tg and "," in tg:
-              chat_id, token = [x.strip() for x in tg.split(",", 1)]
-          
-              msg = f"⚠️ GOST 启动失败，第 {retry}/5 次，5 分钟后重试"
-          
-              try:
-                  urllib.request.urlopen(
-                      f"https://api.telegram.org/bot{token}/sendMessage",
-                      data=urllib.parse.urlencode({
-                          "chat_id": chat_id,
-                          "text": msg
-                      }).encode(),
-                      timeout=10
-                  )
-              except Exception:
-                  pass
-          EOF
+          PYTHON
 
       - name: 🛠️ 安装系统依赖
-        if: ${{ steps.gost.conclusion != 'failure' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -248,13 +169,11 @@ jobs:
             scrot
 
       - name: 🐍 安装 Python 依赖
-        if: ${{ steps.gost.conclusion != 'failure' }}
         run: |
           pip install seleniumbase
           seleniumbase install chromedriver
 
       - name: 🚀 运行脚本
-        if: ${{ steps.gost.conclusion != 'failure' }}
         env:
           PYTHONIOENCODING: utf-8
           XSERVER_ACCOUNT: ${{ secrets.XSERVER_ACCOUNT }}
